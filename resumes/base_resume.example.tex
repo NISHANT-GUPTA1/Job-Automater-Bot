@@ -1,0 +1,105 @@
+% Example resume template. Copy it to resumes/base_resume.tex and replace everything with your own details.
+% Rules the bot relies on:
+%   - Everything above the Education section (preamble + header) is copied unchanged into every tailored resume.
+%   - The body must start with the Education section.
+%   - Keep it to one A4 page.
+% Compiles with XeLaTeX / LuaLaTeX (Overleaf: Menu > Compiler > XeLaTeX) or with Tectonic.
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[a4paper,top=0.4in,bottom=0.4in,left=0.45in,right=0.45in]{geometry}
+
+% -------------------- PACKAGES --------------------
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{fontspec}
+\usepackage{xcolor}
+\usepackage{fontawesome5}
+
+% -------------------- FONT --------------------
+\setmainfont{Latin Modern Roman}
+\renewcommand\normalsize{\fontsize{9.5}{11}\selectfont}
+\normalsize
+
+% -------------------- LINKS --------------------
+\hypersetup{
+    colorlinks=true,
+    urlcolor=black,
+    pdftitle={Your Name - Software Engineer},
+    pdfauthor={Your Name},
+    pdfkeywords={Software Engineer, Python, Java, REST API, SQL}
+}
+
+% -------------------- SECTION FORMAT --------------------
+\titleformat{\section}{\scshape\large\raggedright}{}{0em}{}[\titlerule]
+\titlespacing*{\section}{0pt}{5pt}{3pt}
+
+% -------------------- LIST SPACING --------------------
+\setlist[itemize]{itemsep=1.5pt,topsep=1.5pt,parsep=0pt,leftmargin=1.3em}
+
+% -------------------- GLOBAL --------------------
+\pagenumbering{gobble}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+
+\begin{document}
+
+% -------------------- HEADER --------------------
+\begin{center}
+    {\Huge \scshape Your Name}
+\end{center}
+
+\vspace{-2pt}
+\noindent
+\parbox{\textwidth}{\centering\small
+\href{mailto:you@example.com}{\faEnvelope\ \underline{you@example.com}} \,
+\faPhone\ \underline{+00 0000000000} \,
+\href{https://www.linkedin.com/in/your-profile/}{\faLinkedin\ \underline{LinkedIn}} \,
+\href{https://github.com/your-username}{\faGithub\ \underline{GitHub}} \,
+\href{https://your-portfolio.example.com/}{\faGlobe\ \underline{Portfolio}}
+}
+
+\vspace{4pt}
+
+% -------------------- EDUCATION --------------------
+\section{Education}
+\textbf{Your University} \hfill \textbf{August 2023 - July 2027}\\
+\textit{Bachelor of Technology in Computer Science and Engineering} \hfill \textit{CGPA: 0.00/10}
+
+\textbf{Your School} \hfill \textbf{April 2021 - June 2023}\\
+\textit{Class XII} \hfill \textit{00.0\%}
+
+% -------------------- SKILLS --------------------
+\section{Technical Skills}
+\textbf{Languages:} Python, Java, JavaScript, SQL\\
+\textbf{Backend \& Cloud:} FastAPI, Node.js, REST APIs, Docker, AWS\\
+\textbf{Databases:} PostgreSQL, MySQL, MongoDB\\
+\textbf{Tools:} Git, Linux, CI/CD, Unit Testing
+
+% -------------------- EXPERIENCE --------------------
+\section{Experience}
+\textbf{Company Name - Software Engineering Intern} \hfill \textbf{Month Year - Month Year}
+\begin{itemize}
+    \item Built \textbf{what you built} using \textbf{which technologies}, which led to \textbf{a measurable result}.
+    \item Improved \textbf{something} by \textbf{a number}, by doing \textbf{what you did}.
+\end{itemize}
+
+% -------------------- PROJECTS --------------------
+\section{Projects}
+\textbf{Project Name} \hfill \href{https://github.com/your-username/project}{\textbf{GitHub}}\\
+\textit{Python, FastAPI, PostgreSQL, Docker}
+\begin{itemize}[nosep,left=0pt]
+    \item What the project does, the part you built, and the result in numbers.
+\end{itemize}
+
+% -------------------- ACHIEVEMENTS --------------------
+\section{Achievements}
+\begin{itemize}
+    \item \textbf{Award or rank} - Competition name (Year).
+\end{itemize}
+
+% -------------------- INTERESTS --------------------
+\section{Interests}
+Open Source, Competitive Programming
+
+\end{document}

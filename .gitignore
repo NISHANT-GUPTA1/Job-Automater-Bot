@@ -1,0 +1,13 @@
+# Secrets and personal data - never commit these
+.env
+profile.yaml
+data/
+resumes/*
+!resumes/base_resume.example.tex
+
+# Local environment, downloaded tools and build output
+.venv/
+tools/
+__pycache__/
+*.pyc
+job-applier-bundle.tar.gz

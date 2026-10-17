@@ -1,0 +1,62 @@
+# Copy this file to profile.yaml and fill in your own details. Never commit profile.yaml.
+# These answers are used to fill application forms and to write emails and cover letters.
+# Anything left empty is asked on Telegram the first time a form needs it, and remembered.
+# Skills and experience details come from your resume (resumes/base_resume.tex), not from here.
+
+personal:
+  first_name: ""
+  last_name: ""
+  full_name: ""
+  phone: ""                 # without country code, e.g. 9876543210
+  phone_country_code: "+91"
+  date_of_birth: ""         # YYYY-MM-DD
+  gender: ""                # Male / Female / Prefer not to say
+  nationality: ""
+  address: ""
+  city: ""
+  state: ""
+  country: ""
+  pincode: ""
+
+links:
+  linkedin: ""
+  github: ""
+  portfolio: ""
+  leetcode: ""
+
+education:
+  current_status: ""        # e.g. "Final year B.Tech student"
+  degree: ""                # e.g. "Bachelor of Technology (B.Tech)"
+  branch: ""
+  college: ""
+  university: ""
+  start_year: ""
+  graduation_year: ""
+  cgpa: ""
+  tenth_percentage: ""
+  twelfth_percentage: ""
+  twelfth_board: ""
+  active_backlogs: "0"
+
+experience:
+  total_years: "0"
+  internships:
+    - company: ""
+      role: ""
+      duration: ""          # e.g. "May 2024 - July 2024"
+
+preferences:
+  roles_wanted: "Software Engineer, Backend Developer"   # comma separated, first one is the default
+  expected_ctc: ""          # e.g. "6 LPA"
+  current_ctc: "0"
+  notice_period: ""         # e.g. "Immediate"
+  willing_to_relocate: "Yes"
+  preferred_locations: ""
+  work_authorization_india: "Yes"
+  requires_visa_sponsorship: "No"
+
+# Ready answers for questions that come up often. Add your own.
+standard_answers:
+  "Why do you want to work here?": ""
+  "Tell us about yourself": ""
+  "How did you hear about this job?": "LinkedIn"
