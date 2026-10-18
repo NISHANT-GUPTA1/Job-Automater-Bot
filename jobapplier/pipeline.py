@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 
 from . import config, db, jobs, latex, mailer, memory, profile, tracker
-from .asker import asker
+from .asker import JobCancelled, asker, cancelled, current_job
 from .browser import apply_to_job
 from .llm import llm
 from .resume import (ats_coverage, body_text, cover_letter, find_similar_resume, generate_tailored, resume_for_job,
@@ -23,7 +23,11 @@ async def worker() -> None:
     """Runs interactive steps one job at a time so questions never get mixed up."""
     while True:
         kind, job_id, extra = await queue.get()
+        token = current_job.set(job_id)  # questions asked from here on get a "Skip job" button
         try:
+            job = db.get_job(job_id)
+            if job_id in cancelled or (kind == "process" and job and job["status"] == "skipped"):
+                continue  # you skipped it - don't start it again
             if kind == "process":
                 await process_job(job_id, extra)
             elif kind == "apply":
@@ -34,11 +38,15 @@ async def worker() -> None:
                 await tailor_flow(job_id, notes=extra.get("notes", ""))
             elif kind == "cover":
                 await cover_letter_flow(job_id, extra.get("notes", ""))
+        except JobCancelled:
+            db.set_status(job_id, "skipped", "skipped by you")
+            await asker.say(f"⏭ Job #{job_id} skipped. (/retry {job_id} if you change your mind)")
         except Exception as e:
             log.error("job %s %s failed: %s", job_id, kind, traceback.format_exc())
             db.log(job_id, "error", f"{kind}: {e}")
             await asker.say(f"❌ Job #{job_id} ({kind}) failed: {str(e)[:500]}")
         finally:
+            current_job.reset(token)
             queue.task_done()
 
 
@@ -55,14 +63,18 @@ async def process_job(job_id: int, extra: dict) -> None:
         details = await analyze_and_report(job_id, job["url"], extra.get("text"))
         job = db.get_job(job_id)
 
-    if details.get("eligible") is False:
+    already_decided = db.q1("SELECT 1 FROM events WHERE job_id=? AND kind IN "
+                            "('eligible_override', 'resume_approved', 'status:applying')", (job_id,))
+    if details.get("eligible") is False and not already_decided:  # never ask the same job twice
         choice = await asker.ask(f"Job #{job_id} may not fit: {details.get('eligibility_note')}\nApply anyway?",
                                  ["✅ Apply anyway", "⏭ Skip"])
         if not choice or choice.startswith("⏭"):
             db.set_status(job_id, "skipped", "not eligible")
             return
+        db.log(job_id, "eligible_override", "you chose to apply anyway")
 
-    if profile.base_resume_text() and not details.get("outreach") and \
+    approved = db.q1("SELECT 1 FROM resumes WHERE job_id=? AND status='approved'", (job_id,))
+    if profile.base_resume_text() and not details.get("outreach") and not approved and \
             (config.ALWAYS_TAILOR or details.get("resume_tailoring_recommended")):
         # every job gets a recruiter-checked resume (a similar approved one is offered first - free)
         await tailor_flow(job_id, details.get("tailoring_reason") or "")
@@ -75,6 +87,9 @@ async def process_job(job_id: int, extra: dict) -> None:
     no_link = job["url"].startswith("text:")
     if (to or no_link) and not job["emailed_at"]:  # screenshot/text jobs: cold email is the way to apply
         await email_flow(job_id, to)
+    if db.get_job(job_id)["status"] in ("new", "analyzed", "applying"):
+        # finished without applying or emailing (e.g. you chose not to): close it so it never comes back
+        db.set_status(job_id, "skipped", "finished without applying or emailing")
     await asker.say(f"🏁 Job #{job_id} done. Status: {db.get_job(job_id)['status']}  (/job {job_id})\n"
                     f"{tracker.job_cost_text(job_id)}")
 
@@ -96,6 +111,21 @@ async def apply_step(job_id: int) -> None:
 # ---- resume tailoring -------------------------------------------------------
 
 async def tailor_flow(job_id: int, reason: str = "", notes: str = "") -> str:
+    # A resume already made for THIS job (e.g. the job was skipped or interrupted after drafting): reuse it
+    own = db.q1("""SELECT * FROM resumes WHERE job_id=? AND status IN ('approved', 'draft')
+                   ORDER BY (status='approved') DESC, id DESC LIMIT 1""", (job_id,))
+    if own and Path(own["path"]).exists() and not notes:
+        if own["status"] == "approved":
+            return own["path"]
+        await asker.send_file(own["path"], f"Resume drafted earlier for job #{job_id}")
+        choice = await asker.ask(f"Job #{job_id}: you already have this resume drafted for this job (no extra cost). "
+                                 f"Use it?", ["✅ Use it", "✍️ Make a new one"])
+        if choice and choice.startswith("✅"):
+            db.run("UPDATE resumes SET status='approved' WHERE id=?", (own["id"],))
+            db.update_job(job_id, resume_path=own["path"])
+            db.log(job_id, "resume_approved", f"reused earlier draft {own['path']}")
+            return own["path"]
+
     similar = find_similar_resume(job_id) if not notes else None  # your own points need a fresh resume
     if similar:
         row, other, score = similar

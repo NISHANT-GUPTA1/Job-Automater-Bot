@@ -22,11 +22,12 @@ this repository.
 3. [Keeping it running](#keeping-it-running)
 4. [Using the bot](#using-the-bot)
 5. [How an application is handled](#how-an-application-is-handled)
-6. [Settings (.env)](#settings-env)
-7. [Running costs](#running-costs)
-8. [Where your data is stored](#where-your-data-is-stored)
-9. [Troubleshooting](#troubleshooting)
-10. [Project layout](#project-layout)
+6. [Prospector: cold outreach to small companies](#prospector-cold-outreach-to-small-companies)
+7. [Settings (.env)](#settings-env)
+8. [Running costs](#running-costs)
+9. [Where your data is stored](#where-your-data-is-stored)
+10. [Troubleshooting](#troubleshooting)
+11. [Project layout](#project-layout)
 
 ---
 
@@ -285,6 +286,68 @@ Image captchas are also sent as a picture with numbered tiles. Reply with the nu
 
 The bot never makes up employers, job titles, dates, grades, numbers or projects. Questions written to catch AI
 ("if you are an AI, write…") are never followed. You are told about them and decide the answer yourself.
+
+---
+
+## Prospector: cold outreach to small companies
+
+A second, separate bot for reaching people directly instead of applying through job sites. Every day it:
+
+1. finds small companies hiring for the roles you list (software, backend, Python, full-stack, React, AI
+   engineers and interns): from the monthly Hacker News "Who is hiring?" thread (filtered to posts open to India /
+   worldwide and to juniors or interns), Apollo company search if your plan has it, and companies you send it
+2. keeps only companies of the size you're targeting (1–50 employees first), using Apollo's company lookup
+3. finds who to write to, cheapest source first: a hiring email in the job post itself, hiring addresses the
+   company publishes on its own website (careers@, hr@, jobs@…), then Hunter.io for named HR, engineering-manager
+   or founder emails. Order of preference: HR / hiring inbox → engineering manager / CTO → founder → general inbox
+4. checks each company's public job board (Greenhouse, Lever, Ashby) for open roles that fit you
+5. drafts a personal email for each (with your resume attached) and sends you the day's batch on Telegram
+6. after you approve, sends them a few minutes apart, never more than your daily limit
+7. watches your inbox: replies are reported to you and stop further emails; one follow-up goes out in the same
+   thread after a few days if there's no answer; bounced addresses are marked
+
+Nobody is emailed twice, including people the job bot already emailed.
+
+You can also send it companies yourself (a website, a Wellfound or LinkedIn company link, a list of names, or a
+screenshot). Wellfound has no public API and doesn't allow scraping, so the bot can't search it on its own.
+
+### Setup
+
+1. Create a **second** Telegram bot with @BotFather and put its token in `.env` as `PROSPECTOR_TELEGRAM_BOT_TOKEN`.
+2. Create an Apollo.io account and copy your API key (Settings → Integrations → API) into `APOLLO_API_KEY`.
+   On the free plan only the company lookup (size) works through the API; people and email search need a
+   paid plan, which the bot uses automatically if you have one.
+3. Optional but recommended: create a free Hunter.io account and put its API key in `HUNTER_API_KEY`.
+4. Check what your plans allow:
+   ```powershell
+   .venv\Scripts\python prospector_main.py --check
+   ```
+5. Start it, or install it to run in the background:
+   ```powershell
+   .venv\Scripts\python prospector_main.py
+   powershell -ExecutionPolicy Bypass -File deploy\install_autostart.ps1 -Bot prospector
+   ```
+
+### Credits
+
+| Step | Cost |
+|---|---|
+| Hacker News, company websites, public job boards | free |
+| Company size check (Apollo company lookup) | 1 Apollo credit per company, only when the size is unknown |
+| Named contact from Hunter.io | 1 of your 25 free Hunter searches a month (used only when the website has no hiring address) |
+| Apollo people/email search | paid Apollo plans only |
+
+Monthly caps (`APOLLO_MONTHLY_CREDITS`, `HUNTER_MONTHLY_SEARCHES`) stop the bot before it goes over. Only verified
+or published emails are used, to keep your Gmail's sender reputation clean.
+
+### Daily batch
+
+At `PROSPECT_SEND_HOUR` you get a summary with **Send all**, and every draft with **Send**, **Edit** (tell it what to
+change) and **Drop** (never contact this person). Commands: `/run` (prepare now), `/drafts`, `/add`, `/stats`,
+`/export` (Excel sheet of companies, contacts, emails and credits), `/companies`, `/stage 1|2|3` (company size
+1–50, 51–200, 201–500), `/pause`, `/resume`, `/check`.
+
+Keep the daily limit low (10–20). Sending many cold emails a day from a personal Gmail gets it flagged as spam.
 
 ---
 

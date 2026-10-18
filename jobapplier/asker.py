@@ -1,5 +1,6 @@
 """Lets background automation ask the user a question on Telegram and wait for the reply."""
 import asyncio
+import contextvars
 import itertools
 import logging
 from pathlib import Path
@@ -11,14 +12,23 @@ from . import config
 log = logging.getLogger(__name__)
 MAX_LEN = 4000
 
+# The job the worker is currently handling (set by pipeline.worker); questions about it get a Skip button.
+current_job: contextvars.ContextVar[int | None] = contextvars.ContextVar("current_job", default=None)
+cancelled: set[int] = set()   # jobs you skipped: their open questions and next steps stop immediately
+_CANCEL = "__skip_this_job__"
+
+
+class JobCancelled(Exception):
+    """Raised inside a job's flow when you skip that job; the worker marks it skipped."""
+
 
 class Asker:
     def __init__(self) -> None:
         self.bot: Bot | None = None
         self.chat_id: int | None = None
         self._ids = itertools.count(1)
-        # key -> (future, options, telegram message id)
-        self.pending: dict[int, tuple[asyncio.Future, list[str] | None, int, str]] = {}
+        # key -> (future, options, telegram message id, question, job id)
+        self.pending: dict[int, tuple] = {}
 
     def bind(self, bot: Bot, chat_id: int) -> None:
         self.bot, self.chat_id = bot, chat_id
@@ -57,25 +67,42 @@ class Asker:
         browser=True adds a button that opens the bot's browser on the phone."""
         if not self.bot:
             raise RuntimeError("Telegram bot not bound")
+        job = current_job.get()
+        if job in cancelled:
+            raise JobCancelled(job)
         key = next(self._ids)
         link = self.browser_button() if browser else None
-        if options or link:
+        skip = [InlineKeyboardButton(f"🛑 Skip job #{job}", callback_data=f"skip|{job}")] if job else None
+        if options or link or skip:
             rows = [[InlineKeyboardButton(o, callback_data=f"ans|{key}|{i}")] for i, o in enumerate(options or [])]
-            markup = InlineKeyboardMarkup(([link] if link else []) + rows)
-            text = f"❓ {question}" + ("" if options else "\n\n(Send your answer as a message)")
+            markup = InlineKeyboardMarkup(([link] if link else []) + rows + ([skip] if skip else []))
+            text = f"❓ {question}" + ("" if options else "\n\n(Reply to this message with your answer)")
         else:
             markup = ForceReply(selective=True)
             text = f"❓ {question}\n\n(Reply to this message with your answer)"
         msg = await self.bot.send_message(self.chat_id, text[:MAX_LEN], reply_markup=markup)
         fut = asyncio.get_running_loop().create_future()
-        self.pending[key] = (fut, options, msg.message_id, question)
+        self.pending[key] = (fut, options, msg.message_id, question, job)
         try:
-            return await asyncio.wait_for(fut, (timeout_min or config.QUESTION_TIMEOUT_MIN) * 60)
+            answer = await asyncio.wait_for(fut, (timeout_min or config.QUESTION_TIMEOUT_MIN) * 60)
         except asyncio.TimeoutError:
             await self.say(f"⏰ No answer received, moving on: {question[:200]}")
             return None
         finally:
             self.pending.pop(key, None)
+        if answer == _CANCEL:
+            raise JobCancelled(job)
+        return answer
+
+    def cancel_job(self, job_id: int) -> int:
+        """Skip a job: its open questions are closed and its flow stops at the next step. Returns #closed."""
+        cancelled.add(job_id)
+        closed = 0
+        for v in self.pending.values():
+            if len(v) > 4 and v[4] == job_id and not v[0].done():
+                v[0].set_result(_CANCEL)
+                closed += 1
+        return closed
 
     def answer_button(self, key: int, idx: int) -> str | None:
         item = self.pending.get(key)

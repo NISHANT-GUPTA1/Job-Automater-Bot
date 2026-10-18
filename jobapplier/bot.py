@@ -1,5 +1,6 @@
 """Telegram bot: send job links / job details, answer questions, check your tracker."""
 import asyncio
+from datetime import datetime, timedelta
 import hashlib
 import logging
 import re
@@ -10,7 +11,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           MessageHandler, filters)
 
 from . import assistant, config, db, jobs, memory, profile, remote, tracker
-from .asker import asker
+from .asker import asker, cancelled
 from .browser import browser
 from .pipeline import analyze_and_report, create_outreach_job, queue, worker
 
@@ -33,6 +34,7 @@ Add an email after the link to cold-mail someone too: <link> hr@company.com
 /email <id> [to] — draft a cold email for a job
 /resume <id> — draft a tailored resume for a job
 /retry <id> — run the application again
+/skip <id> — stop a job now (also: the 🛑 Skip job button on its questions)
 /screen — screenshot of the bot's browser right now
 /remote — link to see & control the bot's browser from your phone (captchas, logins, stuck pages)
 /open <url> — open a page in the bot's browser (e.g. log in to a site yourself from the phone)
@@ -157,11 +159,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def do_action(update: Update, action: str | None, job_id: int, status: str | None) -> None:
     job = db.get_job(job_id)
     if action == "retry" and not job["url"].startswith("text:"):
+        cancelled.discard(job_id)
         await queue.put(("apply", job_id, {}))
         await reply(update, f"🔁 Job #{job_id} queued for applying.")
     elif action == "skip":
-        db.set_status(job_id, "skipped", "by you")
-        await reply(update, f"⏭ Job #{job_id} skipped.")
+        await skip_job(update, job_id)
     elif action == "status" and status in STATUSES:
         db.set_status(job_id, status, "by you")
         await reply(update, f"Job #{job_id} → {status}")
@@ -297,6 +299,36 @@ async def process_screenshots(update: Update, msgs: list) -> None:
     if skipped:
         summary += "\n⚠️ Couldn't read " + "; ".join(skipped)
     await reply(update, summary)
+
+
+async def skip_job(update: Update, job_id: int) -> None:
+    """Stop a job now (even mid-way) and never resume it on its own."""
+    closed = asker.cancel_job(job_id)
+    db.set_status(job_id, "skipped", "skipped by you")
+    if not closed:  # nothing was waiting on you; the running flow (if any) stops at its next step
+        await reply(update, f"⏭ Job #{job_id} skipped. (/retry {job_id} to undo)")
+
+
+@owner_only
+async def on_skip_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    try:
+        await query.answer("Skipping…")
+    except TelegramError:
+        pass
+    job_id = int(query.data.split("|")[1])
+    asker.cancel_job(job_id)
+    db.set_status(job_id, "skipped", "skipped by you")
+    await query.edit_message_text(f"{query.message.text or ''}\n\n⏭ Skipped job #{job_id}")
+
+
+@owner_only
+async def cmd_skip(update: Update, ctx) -> None:
+    job_id = _arg_id(ctx)
+    if not job_id or not db.get_job(job_id):
+        await reply(update, "Usage: /skip <job id>")
+        return
+    await skip_job(update, job_id)
 
 
 @owner_only
@@ -477,6 +509,7 @@ async def cmd_retry(update: Update, ctx) -> None:
     if not job or job["url"].startswith("text:"):
         await reply(update, "Usage: /retry <job id> (only for jobs with a link)")
         return
+    cancelled.discard(job_id)
     await queue.put(("apply", job_id, {}))
     await reply(update, f"🔁 Job #{job_id} queued for applying.")
 
@@ -542,7 +575,11 @@ async def post_init(app: Application) -> None:
         asker.bind(app.bot, int(config.TELEGRAM_CHAT_ID))
         asyncio.get_running_loop().create_task(worker())
         # resume jobs that were interrupted by a restart
-        for r in db.q("SELECT id FROM jobs WHERE status IN ('applying','analyzed') ORDER BY id"):
+        for r in db.q("SELECT id FROM jobs WHERE status IN ('applying','analyzed') AND updated_at >= ? ORDER BY id",
+                      ((datetime.now() - timedelta(days=3)).isoformat(timespec="seconds"),)):
+            if db.q1("SELECT 1 FROM events WHERE job_id=? AND kind='auto_resumed'", (r["id"],)):
+                continue  # resumed once already - don't keep asking about it after every restart
+            db.log(r["id"], "auto_resumed")
             await queue.put(("process", r["id"], {}))
         await asker.say("🤖 Job Applier is online. Send me a job link. /help")
         try:
@@ -561,11 +598,12 @@ def build_app() -> Application:
            .post_init(post_init).post_shutdown(post_shutdown).build())
     for name, fn in [("start", cmd_help), ("help", cmd_help), ("jobs", cmd_jobs), ("job", cmd_job),
                      ("stats", cmd_stats), ("export", cmd_export), ("creds", cmd_creds), ("email", cmd_email),
-                     ("resume", cmd_resume), ("retry", cmd_retry), ("status", cmd_status), ("mail", cmd_mail), ("screen", cmd_screen), ("mailed", cmd_mailed),
+                     ("resume", cmd_resume), ("retry", cmd_retry), ("status", cmd_status), ("mail", cmd_mail), ("skip", cmd_skip), ("screen", cmd_screen), ("mailed", cmd_mailed),
                      ("remote", cmd_remote), ("open", cmd_open),
                      ("memory", cmd_memory), ("teach", cmd_teach), ("forget", cmd_forget), ("reload", cmd_reload)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^ans\|"))
+    app.add_handler(CallbackQueryHandler(on_skip_button, pattern=r"^skip\|"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app

@@ -139,6 +139,10 @@ def save_account(domain: str, email: str, password: str, login_url: str = "", jo
         (domain, email, crypto.encrypt(password), login_url, job_id, now()))
 
 
+def delete_account(domain: str) -> None:
+    run("DELETE FROM accounts WHERE domain=?", (domain,))
+
+
 def list_accounts() -> list[dict]:
     return [{"domain": r["domain"], "email": r["email"], "password": crypto.decrypt(r["password_enc"]),
              "login_url": r["login_url"], "created_at": r["created_at"]}

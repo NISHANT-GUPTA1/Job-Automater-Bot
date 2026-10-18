@@ -11,7 +11,7 @@ import re
 import smtplib
 import time
 from email.message import EmailMessage
-from email.utils import parsedate_to_datetime
+from email.utils import formataddr, make_msgid, parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -24,12 +24,17 @@ def _check_config() -> None:
         raise RuntimeError("GMAIL_ADDRESS / GMAIL_APP_PASSWORD missing in .env")
 
 
-def _send(to: str, subject: str, body: str, attachments: list[str]) -> None:
+def _send(to: str, subject: str, body: str, attachments: list[str], in_reply_to: str | None = None,
+          from_name: str | None = None) -> str:
     _check_config()
     msg = EmailMessage()
-    msg["From"] = config.GMAIL_ADDRESS
+    msg["From"] = formataddr((from_name, config.GMAIL_ADDRESS)) if from_name else config.GMAIL_ADDRESS
     msg["To"] = to
     msg["Subject"] = subject
+    msg["Message-ID"] = make_msgid(domain=config.GMAIL_ADDRESS.split("@")[-1])
+    if in_reply_to:  # follow-up: shows up as a reply in the same thread
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
     msg.set_content(body)
     for path in attachments:
         p = Path(path)
@@ -39,10 +44,63 @@ def _send(to: str, subject: str, body: str, attachments: list[str]) -> None:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60) as s:
         s.login(config.GMAIL_ADDRESS, config.GMAIL_APP_PASSWORD)
         s.send_message(msg)
+    return msg["Message-ID"]
 
 
-async def send_email(to: str, subject: str, body: str, attachments: list[str]) -> None:
-    await asyncio.to_thread(_send, to, subject, body, attachments)
+async def send_email(to: str, subject: str, body: str, attachments: list[str], in_reply_to: str | None = None,
+                     from_name: str | None = None) -> str:
+    """Send through Gmail; returns the Message-ID (used to thread follow-ups)."""
+    return await asyncio.to_thread(_send, to, subject, body, attachments, in_reply_to, from_name)
+
+
+def _messages_from(addresses: list[str], since_ts: float) -> dict[str, str]:
+    """Which of these addresses wrote to us since since_ts -> {address: first lines of their latest mail}."""
+    _check_config()
+    found: dict[str, str] = {}
+    if not addresses:
+        return found
+    days = max(1, int((time.time() - since_ts) / 86400) + 1)
+    with imaplib.IMAP4_SSL("imap.gmail.com") as m:
+        m.login(config.GMAIL_ADDRESS, config.GMAIL_APP_PASSWORD)
+        m.select("INBOX")
+        for i in range(0, len(addresses), 20):  # Gmail search: from:(a OR b OR ...)
+            chunk = addresses[i:i + 20]
+            query = f"newer_than:{days}d from:({' OR '.join(chunk)})"
+            _, data = m.search(None, "X-GM-RAW", f'"{query}"')
+            for mid in data[0].split()[-50:]:
+                _, msg_data = m.fetch(mid, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                sender = (parseaddr(msg["From"] or "")[1] or "").lower()
+                text, html = _body_text(msg)
+                body = text or BeautifulSoup(html, "html.parser").get_text(" ")
+                if sender in [a.lower() for a in chunk]:
+                    found[sender] = re.sub(r"\s+", " ", body).strip()[:300]
+    return found
+
+
+def _bounces(addresses: list[str], since_ts: float) -> set[str]:
+    """Addresses that came back as undeliverable (mailer-daemon notices mentioning them)."""
+    _check_config()
+    bounced: set[str] = set()
+    days = max(1, int((time.time() - since_ts) / 86400) + 1)
+    with imaplib.IMAP4_SSL("imap.gmail.com") as m:
+        m.login(config.GMAIL_ADDRESS, config.GMAIL_APP_PASSWORD)
+        m.select("INBOX")
+        _, data = m.search(None, "X-GM-RAW", f'"newer_than:{days}d (from:mailer-daemon OR from:postmaster)"')
+        for mid in data[0].split()[-50:]:
+            _, msg_data = m.fetch(mid, "(RFC822)")
+            text, html = _body_text(email.message_from_bytes(msg_data[0][1]))
+            blob = (text + " " + html).lower()
+            bounced.update(a for a in addresses if a.lower() in blob)
+    return bounced
+
+
+async def replies_from(addresses: list[str], since_ts: float) -> dict[str, str]:
+    return await asyncio.to_thread(_messages_from, addresses, since_ts)
+
+
+async def bounces_for(addresses: list[str], since_ts: float) -> set[str]:
+    return await asyncio.to_thread(_bounces, addresses, since_ts)
 
 
 # ---- verification mails ---------------------------------------------------

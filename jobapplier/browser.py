@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 from . import captcha, config, crypto, db, mailer, memory, profile
-from .asker import asker
+from .asker import JobCancelled, asker, cancelled
 from .llm import llm
 
 log = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ EXTRACT_JS = r"""
       f.combobox = true;
       // already-picked values shown as chips (e.g. Workday "How did you hear about us?")
       const cont = el.closest('[data-automation-id^="formField"], .form-group, .field') || (el.parentElement && el.parentElement.parentElement);
-      const chips = cont ? [...cont.querySelectorAll('[data-automation-id="selectedItem"], [class*="chip"], [class*="selected-item"], [class*="pill"]')]
+      const chips = cont ? [...cont.querySelectorAll('[data-automation-id="selectedItem"], [class*="chip"], [class*="selected-item"], [class*="pill"], [class*="single-value"], [class*="singleValue"]')]
                              .map(c => clean(c.innerText)).filter(Boolean) : [];
       if (chips.length && !f.value) f.value = chips.join(', ');
     }
@@ -188,6 +188,11 @@ Rules:
 - Job description page with an Apply button -> click it.
 - Login required and no saved login -> click Sign up / Register / Create account. Prefer email signup; NEVER use "Sign in with Google/LinkedIn/Apple/Facebook".
 - Sign-in failed because the account doesn't exist -> switch to Create account / Sign up with the same email.
+- "Saved login for this site: no" means we have NO account here: on a sign-in form, go to Create Account /
+  Sign up instead of signing in - unless history says the account already exists.
+- page_type "account_exists" if a signup attempt says this email is already registered / an account exists.
+- "Start your application" popups (Autofill with Resume / Apply Manually / Use My Last Application): choose
+  "Apply Manually".
 - page_type "login_failed" if the page says the email/password is wrong or invalid (password fields are refilled
   automatically - just click Sign in again). If history says "LOGIN FAILED with the master password": click
   "Forgot password" / "Reset password", put the login email in the email field and submit. On a "set new password"
@@ -211,12 +216,16 @@ Rules:
   answer to the real question (ignoring the AI-directed part); for questions asking whether AI/automation was
   used, leave "proposed" empty - the candidate decides. Do not put trap fields in fills or ask_user.
 - If history shows a click had no effect, look for missing required fields or ask_user instead of repeating it.
-- final_submit = true only when the click submits the whole application (e.g. "Submit application" on the last step).
-- page_type "success" if the page confirms the application was submitted; "already_applied" if it says so.
+- final_submit = true only when the click submits the whole application on the LAST step (e.g. "Submit" on the
+  Review page). Never for Next / Continue / Save and Continue on earlier pages.
+- page_type "success" if the page confirms the application was submitted ("thank you", "application received",
+  or a candidate home / "My Applications" page listing this job after you submitted); "already_applied" if it says so.
+- page_type "loading" ONLY if there are no fields and no useful buttons yet (spinner/skeleton). If a form or a
+  Next/Continue/Submit button is listed, the page is ready: handle it normally and choose the click.
 - page_type "verify_email" if the site waits for an email verification link or code.
 
 - page_type "job_closed" if the posting says it is closed / no longer accepting applications / expired.
-Return JSON: {{"page_type": "landing|job_list|job_details|login|login_failed|signup|application_form|review|verify_email|success|already_applied|job_closed|error|other",
+Return JSON: {{"page_type": "loading|landing|job_list|job_details|login|login_failed|signup|account_exists|application_form|review|verify_email|success|already_applied|job_closed|error|other",
 "fills": [{{"id": str, "value": str}}], "ask_user": [{{"id": str, "question": str}}],
 "traps": [{{"id": "field id, or empty for page text", "text": "the trap wording", "proposed": str}}],
 "click": "button id or empty", "final_submit": bool, "note": "very short reason"}}"""
@@ -230,6 +239,17 @@ TRAP_RE = re.compile(
     r"|\b(use[ds]?|using|help of)\b.{0,30}\b(ai|chat\s?gpt|gpt|automation|bot|llm)\b.{0,40}\b(fill|complete|apply|application|answer|write)",
     re.I)
 
+
+APPLY_MANUALLY_RE = re.compile(r"^apply manually$", re.I)
+# which button really submits the application (the preview is shown only for that one)
+FINAL_RE = re.compile(r"\b(submit|send application|finish|complete application|apply now)\b", re.I)
+NEXT_RE = re.compile(r"\b(next|continue|save and continue|save & continue|proceed|save draft|save for later)\b", re.I)
+# confirmation text after submitting
+SUCCESS_RE = re.compile(r"thank(s| you) for (applying|your application|your interest)|application (has been |was )?"
+                        r"(submitted|received|sent|complete)|we('ve| have) received your application|"
+                        r"successfully (applied|submitted)|you('ve| have) (successfully )?applied", re.I)
+CREATE_ACCOUNT_RE = re.compile(r"(?:^|\?\s*)(create (an )?account|sign ?up|register( now)?|new user\??|join now|"
+                               r"create account now)$", re.I)
 
 CONSENT_RE = re.compile(r"(accept|allow)( all)?( cookies)?|accept (and|&) (close|continue)|i (accept|agree)|"
                         r"agree( (and|&) (close|continue))?|got it|ok(ay)?|allow (selection|necessary)", re.I)
@@ -250,21 +270,44 @@ def site_key(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _option_score(v: str, option: str) -> int:
+    """How well an option matches the wanted value (0 = not at all). Whole words beat substrings, so
+    "India" picks "India +91" and never "British Indian Ocean Territory +246"."""
+    o = re.sub(r"\s+", " ", option.strip().lower())
+    if not v or not o:
+        return 0
+    if o == v:
+        return 100
+    o_plain = re.sub(r"[^a-z0-9+ ]", " ", o)
+    v_plain = re.sub(r"[^a-z0-9+ ]", " ", v)
+    o_words, v_words = o_plain.split(), v_plain.split()
+    code = re.search(r"\+\d{1,4}", v)
+    if code and re.search(re.escape(code.group(0)) + r"(?!\d)", o):  # "+91" in "India (+91)"
+        return 95 - (5 if re.search(r"\+\d", o) and v_words and v_words[0] not in o_words else 0)
+    if o_words[:len(v_words)] == v_words:  # starts with the value as whole words: "India +91"
+        return 90
+    if re.search(rf"(?<![a-z0-9]){re.escape(v_plain.strip())}(?![a-z0-9])", o_plain):  # whole words inside
+        return 70
+    if len(o) > 3 and re.search(rf"(?<![a-z0-9]){re.escape(o_plain.strip())}(?![a-z0-9])", v_plain):
+        return 60  # option is a whole-word part of the value
+    if v in o:
+        return 40  # inside another word ("india" in "indian") - weakest
+    return 0
+
+
 def best_option(value: str, options: list[str], strict: bool = False) -> str | None:
-    """Pick the option matching value. strict=True only allows exact/substring matches."""
+    """Pick the option matching value. strict=True needs a whole-word match."""
     if not options:
         return None
-    v = value.strip().lower()
-    for o in options:
-        if o.strip().lower() == v:
-            return o
-    for o in options:
-        if v and (v in o.lower() or (o.lower() in v and len(o) > 3)) and len(o) > 1:
-            return o
+    v = re.sub(r"\s+", " ", value.strip().lower())
+    scored = sorted(((_option_score(v, o), -len(o), o) for o in options), reverse=True)
+    best_score, _, best = scored[0]
+    if best_score >= (60 if strict else 40):
+        return best
     if strict:
         return None
-    scored = max(options, key=lambda o: SequenceMatcher(None, v, o.lower()).ratio())
-    return scored if SequenceMatcher(None, v, scored.lower()).ratio() >= 0.75 else None
+    fuzzy = max(options, key=lambda o: SequenceMatcher(None, v, o.lower()).ratio())
+    return fuzzy if SequenceMatcher(None, v, fuzzy.lower()).ratio() >= 0.75 else None
 
 
 # Standard questions answered without asking you or calling the LLM.
@@ -410,6 +453,11 @@ class ApplySession:
         self.seen_traps: set[str] = set()     # AI-trap texts already reported to the user
         self.used_codes: list[str] = []       # verification codes already tried (never reuse a wrong one)
         self.resetting: set[str] = set()      # sites where we're resetting the password via 'Forgot password'
+        self.signup_tried: set[str] = set()   # sites where we already opened 'Create Account' this run
+        self.submitted = False                # the final Submit was clicked
+        self.load_waits = 0                   # waits in a row for a page that's still loading
+        self.pending_signup: set[str] = set() # signups submitted, waiting for the next page to confirm success
+        self.exists_unknown: set[str] = set() # sites that said "account already exists" (password unknown)
 
     # ---- helpers ----------------------------------------------------------
 
@@ -443,9 +491,47 @@ class ApplySession:
             self.passwords[site] = acct["password"] if acct else crypto.master_password()
         return self.passwords[site]
 
+    @staticmethod
+    def login_form(snap: dict) -> bool:
+        """A sign-in form: one password box (no 'confirm password') plus an email/username box."""
+        pw = [f for f in snap["fields"] if f["type"] == "password"]
+        has_user = any(f["type"] in ("email", "text") and re.search(r"e-?mail|user", f["label"] or "", re.I)
+                       for f in snap["fields"])
+        return len(pw) == 1 and has_user
+
+    async def click_text(self, snap: dict, pattern: re.Pattern, note: str) -> bool:
+        for b in snap["buttons"] + snap["links"]:
+            if pattern.search(b["text"].strip()):
+                try:
+                    await self.loc(b["id"]).click(timeout=5000)
+                    self.history.append(note)
+                    await self.page.wait_for_timeout(1500)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    async def auto_navigate(self, snap: dict, site: str) -> bool:
+        """Steps with one obviously right answer, done without the LLM. Returns True if it clicked."""
+        # Workday-style "Start Your Application" popup: apply manually (the bot fills the form itself)
+        if await self.click_text(snap, APPLY_MANUALLY_RE, "chose 'Apply Manually' in the start-application popup"):
+            return True
+        # Sign-in wall on a site where we have no account: create one instead of a doomed sign-in
+        if self.login_form(snap) and not db.get_account(site) and site not in self.exists_unknown \
+                and site not in self.signup_tried:
+            self.signup_tried.add(site)
+            if await self.click_text(snap, CREATE_ACCOUNT_RE,
+                                     "no account on this site yet - opened 'Create Account' (not Sign In)"):
+                return True
+        return False
+
     async def login_failed(self, site: str) -> None:
-        """Wrong password / no account: try the master password, then reset it via 'Forgot password'."""
+        """Wrong password / no account: create one if we never had one, else master password, then reset."""
         self.login_failures = getattr(self, "login_failures", 0) + 1
+        if not db.get_account(site) and site not in self.exists_unknown:
+            self.signup_tried.discard(site)  # let auto_navigate open "Create Account" on the next step
+            self.history.append("LOGIN FAILED and we never had an account here: click 'Create Account' and sign up")
+            return
         master = crypto.master_password()
         if self.password_for(site) != master:
             self.passwords[site] = master
@@ -516,20 +602,26 @@ class ApplySession:
     async def pick_combobox(self, field: dict, value: str, strict: bool) -> bool:
         """Search-style picker: type, wait for results, click the matching one."""
         frame, loc = self.frame_of(field["id"]), self.loc(field["id"])
+        await loc.click(timeout=4000)
         await loc.fill(value, timeout=5000)
-        await loc.press("Enter")
-        await self.page.wait_for_timeout(1300)
-        texts, opts = await self.popup_options(frame)
-        match = best_option(value, texts, strict)
-        if match:
-            await opts.nth(texts.index(match)).click(timeout=4000)
-            await self.page.wait_for_timeout(600)
-            return True
+        # Look at the list BEFORE pressing anything: Enter would select whatever is highlighted first
+        for attempt in range(2):
+            await self.page.wait_for_timeout(1000)
+            texts, opts = await self.popup_options(frame)
+            match = best_option(value, texts, strict)
+            if match:
+                await opts.nth(texts.index(match)).click(timeout=4000)
+                await self.page.wait_for_timeout(600)
+                return True
+            if texts or attempt:
+                break
+            await loc.press("Enter")  # search boxes that only show results after Enter (e.g. Workday)
         if not texts and not strict:  # plain autocomplete without role=option
             await loc.press("ArrowDown")
             await loc.press("Enter")
             return True
         await loc.fill("", timeout=3000)
+        await self.page.keyboard.press("Escape")
         return False
 
     async def set_first(self, field: dict, candidates: list[str]) -> str | None:
@@ -627,6 +719,18 @@ class ApplySession:
         await asker.say(f"✅ Entered the verification code for {who}.")
         return True
 
+    def wrong_fixed_value(self, f: dict) -> bool:
+        """A country / state / phone-code field that already holds the WRONG value (e.g. '+246' instead of
+        India +91) - it must be set again instead of being treated as done."""
+        if not re.search(r"country|territory|phone code|dial|\bstate\b|province", f["label"] or "", re.I):
+            return False
+        wanted = default_answers(f["label"], f["type"], self.job["company"] or "")
+        if not wanted:
+            return False
+        current = f["value"]
+        return not any(best_option(w, [current], strict=True) or best_option(current, [w], strict=True)
+                       for w in wanted)
+
     async def deterministic_fill(self, fields: list[dict], site: str) -> tuple[list[dict], list[str]]:
         """Fill everything we know without the LLM. Returns (fields still open, labels filled)."""
         remaining, filled = [], []
@@ -644,7 +748,7 @@ class ApplySession:
                 if await self.set_value(f, self.password_for(site)):
                     filled.append(label or "password")
                 continue
-            if f.get("value"):
+            if f.get("value") and not self.wrong_fixed_value(f):
                 filled.append(f"{label} = {f['value'][:40]}")
                 continue
             if is_trap(label):  # never auto-fill: the user sees it first
@@ -722,7 +826,11 @@ class ApplySession:
             await self.page.wait_for_load_state("domcontentloaded", timeout=15000)
         except Exception:
             pass
-        await self.page.wait_for_timeout(2500)
+        try:  # heavy sites (Workday, SuccessFactors) keep loading content after the page "loads"
+            await self.page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        await self.page.wait_for_timeout(1500)
 
     async def screenshot(self, name: str) -> str:
         path = config.SCREENSHOT_DIR / f"job{self.job_id}_{name}_{int(time.time())}.png"
@@ -754,6 +862,15 @@ class ApplySession:
         except Exception as e:
             await asker.say(f"Couldn't read Gmail: {e}")
             found = None
+        if site in self.resetting and not (found and found.get("link")):
+            # We asked for a password reset but no email came: there is no account here - create one instead
+            self.resetting.discard(site)
+            self.exists_unknown.discard(site)
+            self.signup_tried.discard(site)
+            db.delete_account(site)
+            self.history.append("no password-reset email arrived, so there's no account here: "
+                                "go back to the sign-in page and click 'Create Account'")
+            return True
         if found and found.get("link"):
             self.history.append("opened verification link from email")
             await self.page.goto(found["link"], wait_until="domcontentloaded")
@@ -793,6 +910,8 @@ class ApplySession:
         seen: dict[str, int] = {}
         known = set(browser.ctx.pages)
         for step in range(config.MAX_STEPS_PER_JOB):
+            if self.job_id in cancelled:  # you tapped "Skip job" - stop right here
+                raise JobCancelled(self.job_id)
             await self.wait_settle()
             # follow a newly opened tab (some "Apply" buttons open one)
             new_tabs = [p for p in browser.ctx.pages if p not in known]
@@ -804,6 +923,8 @@ class ApplySession:
             snap = await self.snapshot()
             if await self.accept_cookies(snap):  # cookie banners: handled without the LLM
                 snap = await self.snapshot()
+            if await self.auto_navigate(snap, site):  # popups / login walls with a known right answer
+                continue
 
             # Puzzles that cover the page (or a Cloudflare wall) must be solved now; a captcha
             # checkbox inside a form is handled later, right before the click, after all fields are filled.
@@ -824,11 +945,24 @@ class ApplySession:
                     continue
                 return {"status": res, "note": "manual"}
 
+            if self.submitted and SUCCESS_RE.search(snap["text"]):  # confirmation text: no LLM needed
+                return {"status": "applied", "note": "confirmation page"}
+            if not snap["fields"] and not snap["buttons"] and len(snap["links"]) < 8 \
+                    and self.load_waits < (1 if self.submitted else 6):  # after submit: likely the confirmation
+                # nothing on the page yet = still loading: wait (no LLM call, no asking you)
+                self.load_waits += 1
+                await self.page.wait_for_timeout(5000)
+                seen.pop(sig, None)
+                continue
             remaining, filled = await self.deterministic_fill(snap["fields"], site)
             decision = await self.decide(snap, remaining, filled, site)
             ptype = decision.get("page_type", "other")
             log.info("job %s step %s: %s %s", self.job_id, step, ptype, decision.get("note"))
 
+            if self.submitted and ptype not in ("application_form", "review", "error", "verify_email", "login",
+                                                "login_failed", "signup", "loading"):
+                # after the final submit, any page that isn't a form with errors means it went through
+                return {"status": "applied", "note": f"submitted ({ptype} page after submit)"}
             if ptype == "login_failed":
                 await self.login_failed(site)
                 continue  # re-read the page: password fields get refilled with the right password
@@ -844,8 +978,16 @@ class ApplySession:
                     if res != "retry":
                         return {"status": res, "note": "verification"}
                 continue
-            if ptype == "signup" and any(f["type"] == "password" for f in snap["fields"]):
-                await self.remember_account(site)
+            # A signup we submitted counts only once the site moved past the signup form without an error
+            for s in list(self.pending_signup):
+                if ptype not in ("signup", "login_failed", "error", "account_exists"):
+                    self.pending_signup.discard(s)
+                    await self.remember_account(s)
+            if ptype == "account_exists":  # you (or an earlier run) already have an account here
+                self.pending_signup.discard(site)
+                self.exists_unknown.add(site)
+                self.history.append("ACCOUNT ALREADY EXISTS on this site: go to Sign In with the same email "
+                                    "(password is auto-filled; if it's wrong it gets reset via 'Forgot password')")
 
             by_id = {f["id"]: f for f in remaining}
             traps = {t.get("id") or f"text:{t.get('text', '')[:60]}": t for t in decision.get("traps") or []}
@@ -883,13 +1025,26 @@ class ApplySession:
                     self.history.append(f"user answered '{f['label'][:40]}'")
 
             click = decision.get("click")
-            if not click:
+            if not click:  # a chosen button is always clicked, whatever the page was called
+                if self.submitted:  # nothing left to do after the final submit = done
+                    return {"status": "applied", "note": "submitted"}
+                if ptype == "loading" and self.load_waits < 6:  # still rendering: wait instead of asking you
+                    self.load_waits += 1
+                    await self.page.wait_for_timeout(5000)
+                    seen.pop(sig, None)
+                    continue
                 res = await self.manual_help(decision.get("note") or "I don't know what to click next.")
                 if res == "retry":
+                    self.load_waits = 0
                     continue
                 return {"status": res, "note": "manual"}
+            self.load_waits = 0
 
-            if decision.get("final_submit") and not config.AUTO_SUBMIT:
+            btn = next((b["text"] for b in snap["buttons"] + snap["links"] if b["id"] == click), click)
+            # the preview is only for the button that really submits - never for Next / Continue / Save
+            final = bool(decision.get("final_submit")) and not NEXT_RE.search(btn) and \
+                (bool(FINAL_RE.search(btn)) or ptype == "review")
+            if final and not config.AUTO_SUBMIT:
                 shot = await self.screenshot("review")
                 await asker.send_photo(shot, f"📝 Job #{self.job_id} ready to submit: {self.job['title']} @ {self.job['company']}")
                 choice = await asker.ask(f"Submit application for job #{self.job_id}?",
@@ -907,12 +1062,13 @@ class ApplySession:
                     return {"status": "skipped", "note": "captcha"}
                 self.history.append("solved captcha")
 
-            btn = next((b["text"] for b in snap["buttons"] if b["id"] == click), click)
             try:
                 await self.loc(click).click(timeout=8000)
-                self.history.append(f"clicked '{btn}'")
+                self.history.append(f"clicked '{btn}'" + (" (FINAL SUBMIT)" if final else ""))
+                if final:
+                    self.submitted = True
                 if ptype == "signup":
-                    await self.remember_account(site)
+                    self.pending_signup.add(site)  # saved once the next page confirms it worked
             except Exception as e:
                 self.history.append(f"click '{btn}' failed: {str(e)[:80]}")
 
