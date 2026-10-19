@@ -77,7 +77,8 @@ async def resolve_domain(name: str) -> str | None:
 
 
 async def discover() -> int:
-    """New companies for the current size stage: Apollo search if your plan has it, else free job APIs."""
+    """New companies for the current size stage: Apollo search if your plan has it, else the YC startup
+    directory, then Hacker News "Who is hiring?" and free job APIs."""
     new = 0
     if db.get_setting("apollo_search_blocked") != "1":
         key = f"apollo_page_stage{stage()}"
@@ -95,11 +96,12 @@ async def discover() -> int:
         except apollo.ApolloBlocked:
             db.set_setting("apollo_search_blocked", "1")  # free plan: don't try again
     seen = {r["name"].lower() for r in db.q("SELECT name FROM companies")}
-    sources = []
-    if db.get_setting("hn_thread_done") != datetime.now().strftime("%Y-%m"):  # the HN thread is monthly
+    sources = await jobsources.yc_companies(seen)
+    if len(sources) < 25:
         sources += await jobsources.hn_who_is_hiring()
-        db.set_setting("hn_thread_done", datetime.now().strftime("%Y-%m"))
-    sources += await jobsources.hiring_companies()
+        sources += await jobsources.hiring_companies()
+    # small companies first, then remote roles abroad, then India (research picks companies in this order)
+    sources.sort(key=lambda j: j.get("priority") or (0, 1, 3, 0))
     for job in sources:
         if job["company"].lower() in seen or new >= 25:
             continue
@@ -111,8 +113,11 @@ async def discover() -> int:
         cid, created = add_company(job["company"], domain, source=job["source"])
         if not created:
             continue
-        db.update("companies", cid, roles_json=json.dumps([{"title": job["title"], "url": job["url"],
-                                                            "source": job["source"]}]))
+        db.update("companies", cid, roles_json=json.dumps(job.get("roles") or [{"title": job["title"], "url": job["url"],
+                                                                                "source": job["source"]}]),
+                  employees=job.get("employees"), description=job.get("description") or None,
+                  size_stage=next((st for st, top in sorted(config.STAGE_MAX_EMPLOYEES.items())
+                                   if (job.get("employees") or 0) <= top), stage()))
         if job.get("email"):  # written in the post itself: usually the founder / hiring manager
             _add_contact(cid, f"post:{job['email']}", f"{job['company']} Hiring Contact",
                          "Hiring contact (from their job post)", 1, job["email"], "published")
@@ -132,7 +137,8 @@ async def check_size(company_id: int) -> bool:
             c = db.q1("SELECT * FROM companies WHERE id=?", (company_id,))
         except (apollo.ApolloBlocked, apollo.ApolloOutOfCredits, httpx.HTTPError) as e:
             log.info("size check skipped for %s: %s", c["name"], e)
-    if c["employees"] and c["employees"] > config.STAGE_MAX_EMPLOYEES[stage()]:
+    # YC companies of 51-200 are only picked once the small ones run out, so they carry their own stage
+    if c["employees"] and c["employees"] > config.STAGE_MAX_EMPLOYEES[max(stage(), c["size_stage"] or 1)]:
         db.update("companies", company_id, status="too_big", updated_at=db.now())
         return False
     return True
@@ -167,7 +173,8 @@ async def research(company_id: int) -> int:
     c = db.q1("SELECT * FROM companies WHERE id=?", (company_id,))
     if not await check_size(company_id):
         return 0
-    roles = await careers.open_roles(c["name"], c["domain"] or "")
+    # YC roles were already filtered by location and experience; other companies: look at their job board
+    roles = [] if c["source"] == "yc" else await careers.open_roles(c["name"], c["domain"] or "")
     if roles or not c["roles_json"]:
         db.update("companies", company_id, roles_json=json.dumps(roles, ensure_ascii=False), updated_at=db.now())
     has_roles = bool(roles or json.loads(c["roles_json"] or "[]"))
@@ -239,6 +246,7 @@ async def reveal(contact_id: int) -> bool:
 INITIAL_PROMPT = """Write a cold email from the candidate to {name} ({title}) at {company} ({website}).
 Recipient type: {tier_label}.
 Open roles at this company that fit the candidate: {roles}
+{location_note}
 
 Write it for this person:
 - HR / recruiter: ask to be considered for the most fitting role (or software/AI engineering roles / internships
@@ -264,7 +272,18 @@ ask one easy question. Same sign-off. Return JSON: {{"body": str}}"""
 
 def _roles_text(company) -> str:
     roles = json.loads(company["roles_json"] or "[]")
-    return ", ".join(r["title"] for r in roles[:5]) or "none listed"
+    return ", ".join(r["title"] + (f" ({r['location']})" if r.get("location") else "") for r in roles[:5]) \
+        or "none listed"
+
+
+def _location_note(company) -> str:
+    """For remote roles at companies abroad: say where the candidate is and that time zones aren't a problem."""
+    roles = json.loads(company["roles_json"] or "[]")
+    loc = roles[0].get("location", "") if roles else ""
+    if not loc or jobsources.location_rank(loc) == 2:
+        return ""
+    return ("The candidate is based in India and would work remotely: mention it in one short clause, with "
+            "willingness to overlap with the team's working hours.")
 
 
 async def draft_initial(contact_id: int, instruction: str = "", previous: dict | None = None) -> dict:
@@ -272,7 +291,7 @@ async def draft_initial(contact_id: int, instruction: str = "", previous: dict |
     co = db.q1("SELECT * FROM companies WHERE id=?", (c["company_id"],))
     prompt = INITIAL_PROMPT.format(name=c["name"], title=c["title"] or "?", company=co["name"],
                                    website=co["website"] or co["domain"] or "", tier_label=config.TIERS[c["tier"]][0],
-                                   roles=_roles_text(co))
+                                   roles=_roles_text(co), location_note=_location_note(co))
     if previous and instruction:
         prompt += (f"\n\nPrevious draft:\n{json.dumps(previous, ensure_ascii=False)}\n"
                    f"Change it as the candidate asks: {instruction}")
@@ -342,7 +361,8 @@ async def prepare_batch(progress=None) -> list[int]:
                     notes.append(f"⚠️ {e}")
                     break
             continue
-        fresh = db.q("SELECT id FROM companies WHERE status='new' ORDER BY id LIMIT ?", (max(4, room * 2),))
+        fresh = db.q("""SELECT id FROM companies WHERE status='new'
+                        ORDER BY COALESCE(size_stage, 1), employees IS NULL, id LIMIT ?""", (max(4, room * 2),))
         if fresh:
             say(f"🔎 Looking for the right people at {len(fresh)} companies…")
             try:

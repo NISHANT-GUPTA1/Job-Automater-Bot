@@ -260,7 +260,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     f = await (msg.photo[-1] if msg.photo else msg.document).get_file()
     post = await jobs.read_image(bytes(await f.download_as_bytearray()))
     text = (post.get("text") or "") + f"\nCompany: {post.get('company') or ''}\nLinks: {' '.join(post.get('links') or [])}"
-    out = await llm.complete_json(EXTRACT_PROMPT.format(text=text[:3000]), purpose="prospect_extract", max_tokens=600)
+    out = await llm.complete_json(EXTRACT_PROMPT.format(text=text[:8000]), purpose="prospect_extract", max_tokens=1500)
     items = out.get("companies") or []
     if items:
         await add_companies(update, items)
