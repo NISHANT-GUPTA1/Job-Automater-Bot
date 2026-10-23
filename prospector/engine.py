@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 from pathlib import Path
 
-from jobapplier import config as base_config, db as jobdb, jobs, mailer, profile
+from jobapplier import config as base_config, db as jobdb, emailedit, jobs, mailer, profile
 from jobapplier.llm import llm
 from jobapplier.resume import _jaccard, _slug, _words, ensure_base_pdf, generate_tailored
 
@@ -186,7 +186,7 @@ async def research(company_id: int) -> int:
             label = {1: f"{c['name']} Hiring Team", 3: f"{c['name']} Founders", 4: f"{c['name']} Team"}[tier]
             candidates.append((tier, -100, e["email"], label, "Team inbox (published on their website)", "published"))
 
-    if not any(t == 1 for t, *_ in candidates) and has_roles:  # worth a Hunter search
+    if has_roles:  # worth a Hunter search (one per domain, cached): names of the people behind the inboxes
         cache_key = f"hunter:{c['domain']}"
         try:
             people = json.loads(db.get_setting(cache_key) or "null")
@@ -212,14 +212,19 @@ async def research(company_id: int) -> int:
         except hunter.HunterUnavailable as e:
             log.info("Hunter skipped for %s: %s", c["name"], e)
 
+    people = [x for x in candidates if x[5] != "published"]
+    inboxes = [x for x in candidates if x[5] == "published"]
+    # hiring@/jobs@ always; hello@/founders@ only when we know nobody by name (it reaches the same people)
+    chosen = people + [x for x in inboxes if x[0] == 1 or not people]
     picked = 0
-    for tier, _, email, name, title, status in sorted(candidates):
+    for tier, _, email, name, title, status in sorted(chosen):
         if _add_contact(company_id, f"{'web' if status == 'published' else 'hunter'}:{email}", name, title, tier,
                         email, status):
             picked += 1
             if picked >= config.CONTACTS_PER_COMPANY:
                 break
-    db.update("companies", company_id, status="people_found" if picked else "no_people", updated_at=db.now())
+    if c["status"] not in ("contacted", "replied"):  # re-checking a company must not reset its progress
+        db.update("companies", company_id, status="people_found" if picked else "no_people", updated_at=db.now())
     return picked
 
 
@@ -259,6 +264,7 @@ Rules: 90-140 words; greet by first name; one line on who the candidate is; 2 co
 resume; say the resume is attached; end with the candidate's name, phone and LinkedIn. Never invent facts, no
 placeholders, no cliches ("I hope this email finds you well", "I am writing to express"). Subject: short and specific
 (the role and the candidate's name).
+{format_rule}
 Return JSON: {{"subject": str, "body": str}}"""
 
 FOLLOWUP_PROMPT = """Write a short, polite follow-up to this cold email that got no reply.
@@ -267,7 +273,8 @@ Recipient: {name} ({title}) at {company}.
 {previous}
 </previous_email>
 Rules: 40-70 words, friendly, no guilt-tripping, add one new short reason to talk (a different real highlight),
-ask one easy question. Same sign-off. Return JSON: {{"body": str}}"""
+ask one easy question. Same sign-off. You may bold one key phrase with **double asterisks**; no other markdown.
+Return JSON: {{"body": str}}"""
 
 
 def _roles_text(company) -> str:
@@ -291,7 +298,8 @@ async def draft_initial(contact_id: int, instruction: str = "", previous: dict |
     co = db.q1("SELECT * FROM companies WHERE id=?", (c["company_id"],))
     prompt = INITIAL_PROMPT.format(name=c["name"], title=c["title"] or "?", company=co["name"],
                                    website=co["website"] or co["domain"] or "", tier_label=config.TIERS[c["tier"]][0],
-                                   roles=_roles_text(co), location_note=_location_note(co))
+                                   roles=_roles_text(co), location_note=_location_note(co),
+                                   format_rule=mailer.FORMAT_RULE)
     if previous and instruction:
         prompt += (f"\n\nPrevious draft:\n{json.dumps(previous, ensure_ascii=False)}\n"
                    f"Change it as the candidate asks: {instruction}")
@@ -314,11 +322,12 @@ async def draft_followup(contact_id: int, instruction: str = "", previous: dict 
 
 
 async def redraft(message_id: int, instruction: str) -> dict:
+    """Apply your edit instruction to one draft: subject, body and/or the attachment's file name."""
     m = db.q1("SELECT * FROM messages WHERE id=?", (message_id,))
-    prev = {"subject": m["subject"], "body": m["body"]}
-    fn = draft_followup if m["kind"] == "followup" else draft_initial
-    new = await fn(m["contact_id"], instruction, prev)
-    db.update("messages", message_id, subject=new["subject"], body=new["body"])
+    attachment = (m["attachment"] or resume_file()) if m["kind"] == "initial" else None
+    new = await emailedit.edit_email(m["subject"], m["body"], attachment, instruction)
+    db.update("messages", message_id, subject=new["subject"], body=new["body"],
+              **({"attachment": new["attachment"]} if attachment else {}))
     return new
 
 
@@ -336,8 +345,9 @@ async def prepare_batch(progress=None) -> list[int]:
     ids: list[int] = []
 
     cutoff = (datetime.now() - timedelta(days=config.FOLLOWUP_DAYS)).isoformat(timespec="seconds")
-    for c in db.q("""SELECT id FROM contacts WHERE status='sent' AND followup_at IS NULL AND sent_at <= ?
-                     ORDER BY sent_at LIMIT ?""", (cutoff, room)):
+    for c in db.q("""SELECT ct.id FROM contacts ct JOIN companies co ON co.id = ct.company_id
+                     WHERE ct.status='sent' AND ct.followup_at IS NULL AND ct.sent_at <= ? AND co.status != 'replied'
+                     ORDER BY ct.sent_at LIMIT ?""", (cutoff, room)):
         d = await draft_followup(c["id"])
         ids.append(db.run("""INSERT INTO messages(contact_id, kind, subject, body, status, batch_date, created_at)
                              VALUES(?,?,?,?,?,?,?)""", (c["id"], "followup", d["subject"], d["body"], "draft", today(), db.now())))
@@ -362,7 +372,7 @@ async def prepare_batch(progress=None) -> list[int]:
                     break
             continue
         fresh = db.q("""SELECT id FROM companies WHERE status='new'
-                        ORDER BY COALESCE(size_stage, 1), employees IS NULL, id LIMIT ?""", (max(4, room * 2),))
+                        ORDER BY COALESCE(size_stage, 1), employees IS NULL, id LIMIT ?""", (max(4, room // 2),))
         if fresh:
             say(f"🔎 Looking for the right people at {len(fresh)} companies…")
             try:
@@ -393,7 +403,7 @@ async def prepare_batch(progress=None) -> list[int]:
 
     drafted = 0
     for c in db.q("""SELECT ct.id, ct.company_id FROM contacts ct JOIN companies co ON co.id = ct.company_id
-                     WHERE ct.status='revealed' AND co.status NOT IN ('skipped', 'too_big')
+                     WHERE ct.status='revealed' AND co.status NOT IN ('skipped', 'too_big', 'replied')
                      ORDER BY (co.roles_json IS NOT NULL AND co.roles_json != '[]') DESC, ct.tier, ct.id"""):
         if drafted >= room:
             break
@@ -405,7 +415,8 @@ async def prepare_batch(progress=None) -> list[int]:
             attachment, note, _ = await resume_for(c["id"])
         except Exception as e:  # never block the email on the resume: fall back to the base resume
             log.warning("tailored resume failed: %s", e)
-            attachment, note = resume_file(), f"your base resume (tailoring failed: {str(e)[:60]})"
+            role = target_role(db.q1("SELECT * FROM companies WHERE id=?", (c["company_id"],)))[0]
+            attachment, note = resume_file(role), f"your base resume (tailoring failed: {str(e)[:60]})"
         ids.append(db.run("""INSERT INTO messages(contact_id, kind, subject, body, status, batch_date, created_at,
                              attachment, attach_note) VALUES(?,?,?,?,?,?,?,?,?)""",
                           (c["id"], "initial", d["subject"], d["body"], "draft", today(), db.now(), attachment, note)))
@@ -414,10 +425,11 @@ async def prepare_batch(progress=None) -> list[int]:
 
 # ---- sending, follow-ups, replies -------------------------------------------------------
 
-def resume_file() -> str:
-    """Your base resume as <Name>_Resume.pdf (the file name recruiters see)."""
+def resume_file(role: str = "") -> str:
+    """Your base resume as <Name>_<Role>.pdf (the file name recruiters see); no role -> Software Engineer."""
     src = ensure_base_pdf()
-    target = config.DATA_DIR / "prospector" / f"{_slug(profile.get('personal.full_name') or 'Candidate')}_Resume.pdf"
+    name = _slug(profile.get('personal.full_name') or 'Candidate')
+    target = config.DATA_DIR / "prospector" / "base" / f"{name}_{_slug(role or 'Software Engineer')}.pdf"
     target.parent.mkdir(parents=True, exist_ok=True)
     if src.exists() and (not target.exists() or target.stat().st_mtime < src.stat().st_mtime):
         shutil.copyfile(src, target)
@@ -462,7 +474,8 @@ async def resume_for(contact_id: int) -> tuple[str, str, bool]:
     if best:
         score, r = best
         name = _slug(profile.get("personal.full_name") or "Candidate")
-        target = config.DATA_DIR / "prospector" / f"{name}_{_slug(role)}.pdf"
+        # one folder per source resume: two companies with the same role title never overwrite each other's file
+        target = config.DATA_DIR / "prospector" / f"from_job_{r['job_id']}" / f"{name}_{_slug(role)}.pdf"
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(r["path"], target)
         return str(target), f"reused the resume made for '{r['title']}' (job #{r['job_id']}, {score:.0%} match) — ₹0", False
@@ -528,7 +541,9 @@ async def check_replies() -> list[dict]:
         if e in replies:
             db.update("contacts", r["id"], status="replied", replied_at=db.now(), reply_snippet=replies[e])
             db.update("companies", r["company_id"], status="replied", updated_at=db.now())
-            db.run("UPDATE messages SET status='dropped' WHERE contact_id=? AND status IN ('draft','approved')", (r["id"],))
+            db.run("""UPDATE messages SET status='dropped' WHERE status IN ('draft','approved') AND contact_id IN
+                      (SELECT id FROM contacts WHERE company_id=?)""", (r["company_id"],))
+            db.run("UPDATE contacts SET status='skipped' WHERE company_id=? AND status='revealed'", (r["company_id"],))
             co = db.q1("SELECT name FROM companies WHERE id=?", (r["company_id"],))
             new.append({"name": r["name"], "title": r["title"], "company": co["name"], "email": r["email"],
                         "snippet": replies[e]})

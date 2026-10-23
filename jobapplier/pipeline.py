@@ -6,7 +6,7 @@ import logging
 import traceback
 from pathlib import Path
 
-from . import config, db, jobs, latex, mailer, memory, profile, tracker
+from . import config, db, emailedit, jobs, latex, mailer, memory, profile, tracker
 from .asker import JobCancelled, asker, cancelled, current_job
 from .browser import apply_to_job
 from .llm import llm
@@ -247,6 +247,7 @@ strongest REAL evidence in the candidate's resume/profile (project, internship r
 - Close: resume attached, available for a call; then name, phone, LinkedIn.
 120-170 words, confident and specific, no clichés ("I am writing to express"), no placeholders like [Name].
 Never claim skills the candidate doesn't have.
+{format_rule}
 Return JSON: {{"subject": str, "body": str}}"""
 
 
@@ -258,6 +259,7 @@ Extra context from the candidate: {note}
 Requirements: 110-150 words; greet the recipient by first name if known (else "Dear Hiring Team");
 {role_rule} Give 2 real, relevant highlights from the resume; polite, confident, no fluff or clichés;
 mention the resume is attached; end with the candidate's name, phone and LinkedIn. No placeholders like [Name].
+{format_rule}
 Return JSON: {{"subject": str, "body": str}}"""
 
 
@@ -272,6 +274,7 @@ async def draft_email(job_id: int, feedback: str = "", previous: dict | None = N
         return await llm.complete_json(OUTREACH_PROMPT.format(
             person=details.get("person_name") or "unknown name", company=job["company"] or "the company",
             role=role or "not specified", note=details.get("note") or "none", feedback=fb,
+            format_rule=mailer.FORMAT_RULE,
             role_rule=(f"ask to be considered for the {role} role;" if role else
                        "ask about any suitable open roles that match the candidate's profile (software/backend engineering);")),
             purpose="cold_email", job_id=job_id, max_tokens=800)
@@ -280,7 +283,8 @@ async def draft_email(job_id: int, feedback: str = "", previous: dict | None = N
                             contact=details.get("contact_name") or "unknown",
                             jd=(job["description"] or "")[:5000] or f"Summary: {job['summary']}\n"
                                f"Key skills: {', '.join(details.get('key_skills', []))}",
-                            feedback=fb, instructions=details.get("application_instructions") or "none given"),
+                            feedback=fb, instructions=details.get("application_instructions") or "none given",
+                            format_rule=mailer.FORMAT_RULE),
         purpose="cold_email", job_id=job_id, max_tokens=800)
 
 
@@ -314,14 +318,14 @@ async def email_flow(job_id: int, to: str | None = None) -> None:
                 db.log(job_id, "email_skipped", f"already emailed {addr}")
                 return
     draft = await draft_email(job_id)
+    attachment = resume_for_job(job_id)
     while True:
-        attachment = resume_for_job(job_id)
         if not Path(attachment).exists():
             await asker.say(f"⚠️ No resume at {attachment}; add resumes/base_resume.pdf first.")
             return
         email_id = db.add_email(job_id, to, draft["subject"], draft["body"], attachment)
         await asker.say(f"✉️ Cold email preview (job #{job_id})\nTo: {to}\nSubject: {draft['subject']}\n"
-                        f"Attachment: {Path(attachment).name}\n\n{draft['body']}")
+                        f"Attachment: {Path(attachment).name}\n\n{mailer.to_plain(draft['body'])}")
         choice = await asker.ask("Send this email?", ["✅ Send", "✏️ Change something", "❌ Cancel"])
         if choice and choice.startswith("✅"):
             try:
@@ -345,7 +349,9 @@ async def email_flow(job_id: int, to: str | None = None) -> None:
             feedback = await asker.ask("What should I change in the email?")
             db.update_email(email_id, status="cancelled")
             if feedback:
-                draft = await draft_email(job_id, feedback, draft)
+                edited = await emailedit.edit_email(draft["subject"], draft["body"], attachment, feedback, job_id)
+                draft = {"subject": edited["subject"], "body": edited["body"]}
+                attachment = edited["attachment"]
                 continue
         db.update_email(email_id, status="cancelled")
         return

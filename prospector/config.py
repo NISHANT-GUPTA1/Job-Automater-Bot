@@ -11,11 +11,23 @@ HUNTER_API_KEY = env("HUNTER_API_KEY")                              # hunter.io 
 HUNTER_MONTHLY_SEARCHES = int(env("HUNTER_MONTHLY_SEARCHES", "50"))
 HUNTER_MONTHLY_VERIFICATIONS = int(env("HUNTER_MONTHLY_VERIFICATIONS", "100"))
 
-DAILY_LIMIT = int(env("PROSPECT_DAILY_LIMIT", "10"))          # emails per day (new + follow-ups)
+# emails per day (new + follow-ups). Gmail allows ~500, but a personal address sending much more than ~50 cold
+# emails a day starts landing in spam - and this is the same address you apply to jobs with.
+DAILY_LIMIT = int(env("PROSPECT_DAILY_LIMIT", "40"))
 SEND_HOUR = int(env("PROSPECT_SEND_HOUR", "10"))               # local hour the daily batch is prepared
 FOLLOWUP_DAYS = int(env("PROSPECT_FOLLOWUP_DAYS", "5"))        # one follow-up after this many days
-CONTACTS_PER_COMPANY = int(env("PROSPECT_CONTACTS_PER_COMPANY", "1"))
-SEND_GAP_MINUTES = (2, 6)                                       # random pause between emails
+CONTACTS_PER_COMPANY = int(env("PROSPECT_CONTACTS_PER_COMPANY", "5"))  # people emailed at one company
+# random pause between emails, in seconds (a steady, human-like pace keeps Gmail happy)
+SEND_GAP_SECONDS = tuple(int(x) for x in env("PROSPECT_SEND_GAP_SECONDS", "40-100").split("-"))
+# LinkedIn (after you log in once with `python linkedin_login.py`): requests to people at companies you emailed.
+# LinkedIn allows ~100 requests a week; staying well below that keeps the account safe.
+LI_DAILY_INVITES = int(env("LINKEDIN_DAILY_INVITES", "15"))
+LI_WEEKLY_INVITES = int(env("LINKEDIN_WEEKLY_INVITES", "90"))
+LI_GAP_SECONDS = tuple(int(x) for x in env("LINKEDIN_GAP_SECONDS", "45-150").split("-"))
+LI_ACTIVE_HOURS = tuple(int(x) for x in env("LINKEDIN_ACTIVE_HOURS", "10-20").split("-"))  # local time
+LI_SEND_NOTES = env_bool("LINKEDIN_SEND_NOTES", False)  # free accounts get ~5 notes a month: plain requests
+LI_AUTO_MESSAGE = env_bool("LINKEDIN_AUTO_MESSAGE", False)  # false: you approve each first message in Telegram
+LI_EVERY_HOURS = float(env("LINKEDIN_EVERY_HOURS", "3"))
 AUTO_DISCOVER = env_bool("PROSPECT_AUTO_DISCOVER", True)        # search Apollo for new companies daily
 
 LOCATIONS = [x.strip() for x in env("PROSPECT_LOCATIONS", "India").split(",") if x.strip()]

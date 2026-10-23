@@ -347,7 +347,40 @@ change) and **Drop** (never contact this person). Commands: `/run` (prepare now)
 `/export` (Excel sheet of companies, contacts, emails and credits), `/companies`, `/stage 1|2|3` (company size
 1–50, 51–200, 201–500), `/pause`, `/resume`, `/check`.
 
-Keep the daily limit low (10–20). Sending many cold emails a day from a personal Gmail gets it flagged as spam.
+**Edit** understands plain requests: `subject: Backend Engineer – Jane Doe`, `rename the resume to
+Jane_Doe_Backend_Engineer`, `make it shorter`. Add "for all emails" to apply the change to every draft in the batch.
+
+Up to `PROSPECT_CONTACTS_PER_COMPANY` people are emailed at each company. When one of them replies, the others
+there get nothing more. Stay under about 50 emails a day (`PROSPECT_DAILY_LIMIT`). Above that, a personal Gmail
+starts landing in spam.
+
+### LinkedIn (optional)
+
+For companies you've emailed, the bot can also connect on LinkedIn with the people there. It gets their profile
+links for free from Hunter results and YC founder pages, so it never searches LinkedIn.
+
+1. Sign in once on the PC:
+
+   ```powershell
+   .venv\Scripts\python linkedin_login.py
+   ```
+
+   A browser opens on LinkedIn's sign-in page. Sign in yourself; the window closes when your feed loads. The bot
+   reuses this session, kept in `data/linkedin_profile`. Your password is never saved anywhere.
+2. Every few hours, between `LINKEDIN_ACTIVE_HOURS`, the bot:
+   - sends a few connection requests (without a note unless `LINKEDIN_SEND_NOTES=true`; free accounts get about
+     5 notes a month), up to `LINKEDIN_DAILY_INVITES` and
+     `LINKEDIN_WEEKLY_INVITES`
+   - checks who accepted
+   - drafts a short first message for each person who accepted and sends it to Telegram for you to approve
+     (**Send / Edit / Skip**)
+   - tells you when someone replies, so you can take over from there.
+3. `/linkedin` shows where everyone is. `/linkedin now` runs a round straight away. `/linkedin pause` and
+   `/linkedin resume` stop and restart it.
+
+LinkedIn's terms don't allow automation, and it does restrict accounts that send too many requests. Keep the
+limits low; the defaults are 15 a day and 90 a week. If LinkedIn logs you out, shows a security check or hits its
+weekly limit, the bot stops and tells you in Telegram.
 
 ---
 

@@ -5,6 +5,7 @@ Compiled locally with Tectonic (tools/tectonic/tectonic.exe, or `tectonic` on PA
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from . import config
@@ -58,6 +59,10 @@ def build(body: str, title: str | None = None, keywords: str | None = None) -> s
     return f"{set_pdf_meta(head, title, keywords)}{body.strip()}\n\n{end}"
 
 
+# the bot runs without a console (pythonw): stop Windows from opening a terminal window for every compile
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
 def compile_pdf(tex: str, out_pdf: Path) -> None:
     """Compile LaTeX source to out_pdf. Raises RuntimeError with the LaTeX error on failure."""
     work = config.DATA_DIR / "latex"
@@ -65,7 +70,8 @@ def compile_pdf(tex: str, out_pdf: Path) -> None:
     src = work / (out_pdf.stem + ".tex")
     src.write_text(tex.replace(FONT_BY_NAME, FONT_BY_FILE), encoding="utf-8")
     proc = subprocess.run([tectonic_path(), "-X", "compile", "--outdir", str(work), str(src)],
-                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+                          creationflags=NO_WINDOW)
     pdf = work / (out_pdf.stem + ".pdf")
     if proc.returncode != 0 or not pdf.exists():
         errors = [l for l in (proc.stderr + proc.stdout).splitlines() if l.startswith("error") or "!" in l]

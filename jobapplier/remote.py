@@ -178,13 +178,14 @@ async def _run_tunnel() -> None:
         await asyncio.to_thread(subprocess.run, ["powershell", "-NoProfile", "-Command",
             "Get-CimInstance Win32_Process -Filter \"Name='cloudflared.exe'\" | Where-Object { $_.CommandLine -like "
             f"'*127.0.0.1:{PORT}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"],
-            capture_output=True, timeout=60)
+            capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
     else:
         await asyncio.to_thread(subprocess.run, ["pkill", "-f", f"cloudflared.*127.0.0.1:{PORT}"], capture_output=True)
     while not _stopping:
         _tunnel = await asyncio.create_subprocess_exec(
             exe, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{PORT}",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         async for raw in _tunnel.stderr:
             m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", raw.decode(errors="ignore"))
             if m:

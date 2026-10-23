@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -13,10 +13,10 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from pathlib import Path
 
-from jobapplier import db as jobdb, jobs
+from jobapplier import db as jobdb, jobs, mailer
 from jobapplier.llm import llm
 
-from . import apollo, config, db, engine, sheet
+from . import apollo, config, db, engine, li_flow, linkedin, sheet
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +35,8 @@ Send me companies any time: links (company site, Wellfound, LinkedIn), names, a 
 /companies — recent companies
 /stage 1|2|3 — company size: 1-50, 51-200, 201-500
 /pause, /resume — stop or restart the daily batch
-/check — what your Apollo plan allows"""
+/check — what your Apollo plan allows
+/linkedin — LinkedIn status · /linkedin now | pause | resume"""
 
 JOB_BOARDS = ("wellfound.com", "angel.co", "linkedin.com", "naukri.com", "instahyre.com", "glassdoor", "indeed.",
               "cutshort.io", "internshala.com", "ycombinator.com", "workatastartup.com")
@@ -73,7 +74,20 @@ def draft_text(m) -> str:
     if m["kind"] == "initial":
         attach = f"📎 {Path(m['attachment'] or engine.resume_file()).name} — {m['attach_note'] or 'your base resume'}\n"
     return (f"{kind} — {c['name']} ({c['title'] or '?'}) @ {co['name']}\n"
-            f"Hiring: {roles}\nTo: {c['email']}\n{attach}Subject: {m['subject']}\n\n{m['body']}")
+            f"Hiring: {roles}\nTo: {c['email']}\n{attach}Subject: {m['subject']}\n\n{mailer.to_plain(m['body'])}")
+
+
+async def refresh_draft(mid: int) -> None:
+    """Show the edited draft: replace the old Telegram message, or post a new one if that's not possible."""
+    m = db.q1("SELECT * FROM messages WHERE id=?", (mid,))
+    try:
+        await _state["bot"].edit_message_text(draft_text(m), chat_id=int(config.TELEGRAM_CHAT_ID),
+                                              message_id=m["tg_message_id"], reply_markup=draft_buttons(mid))
+        return
+    except (TelegramError, TypeError):
+        pass
+    msg = await say(draft_text(m), reply_markup=draft_buttons(mid))
+    db.update("messages", mid, tg_message_id=msg.message_id)
 
 
 def draft_buttons(mid: int) -> InlineKeyboardMarkup:
@@ -142,7 +156,7 @@ async def sender() -> None:
             await say(f"{'📨' if result == 'sent' else '⚠️'} {c['name']} @ {c['company']}: {result} "
                       f"({engine.sent_today()}/{config.DAILY_LIMIT} today)")
             if not send_queue.empty():
-                await asyncio.sleep(random.uniform(*config.SEND_GAP_MINUTES) * 60)
+                await asyncio.sleep(random.uniform(*config.SEND_GAP_SECONDS))
         except Exception as e:
             log.exception("send failed")
             await say(f"❌ Sending failed: {str(e)[:200]}")
@@ -153,6 +167,41 @@ async def sender() -> None:
 async def approve(mid: int) -> None:
     db.update("messages", mid, status="approved")
     await send_queue.put(mid)
+
+
+async def li_notify(text: str, person_id: int | None = None) -> None:
+    if person_id is None:
+        await say(text)
+        return
+    await say(text, reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Send", callback_data=f"l|send|{person_id}"),
+        InlineKeyboardButton("✏️ Edit", callback_data=f"l|edit|{person_id}"),
+        InlineKeyboardButton("🗑 Skip", callback_data=f"l|drop|{person_id}")]]))
+
+
+async def li_run(job) -> None:
+    """Run a LinkedIn step, turning a stop (logged out, limit) into one clear message and a pause."""
+    try:
+        await job(li_notify)
+    except linkedin.LinkedInStop as e:
+        if "weekly" not in str(e):
+            db.set_setting("li_paused", "1")
+        await say(f"⛔ LinkedIn stopped: {e}" + ("" if "weekly" in str(e) else "\nWhen fixed: /linkedin resume"))
+    except Exception as e:
+        log.exception("linkedin step failed")
+        await say(f"⚠️ LinkedIn step failed: {str(e)[:200]}")
+
+
+async def linkedin_loop() -> None:
+    """LinkedIn round every few hours, inside active hours."""
+    await asyncio.sleep(120)
+    while True:
+        last = db.get_setting("li_last_run", "")
+        due = not last or datetime.fromisoformat(last) < datetime.now() - timedelta(hours=config.LI_EVERY_HOURS)
+        if due and li_flow.active_hours() and linkedin.has_session() and db.get_setting("li_paused") != "1":
+            db.set_setting("li_last_run", db.now())
+            await li_run(li_flow.cycle)
+        await asyncio.sleep(300)
 
 
 async def scheduler() -> None:
@@ -233,13 +282,24 @@ def items_from_urls(urls: list[str]) -> list[dict]:
 @owner_only
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
+    if isinstance(_state["editing"], tuple):  # changes to a LinkedIn first message
+        pid, _state["editing"] = _state["editing"][1], None
+        await update.message.reply_text("✍️ Editing…")
+        await li_flow.draft_dm(pid, text)
+        await li_notify(li_flow.dm_text(pid), person_id=pid)
+        return
     if _state["editing"]:  # the answer to "what should I change?"
         mid, _state["editing"] = _state["editing"], None
-        await update.message.reply_text("✍️ Rewriting…")
-        await engine.redraft(mid, text)
-        m = db.q1("SELECT * FROM messages WHERE id=?", (mid,))
-        msg = await say(draft_text(m), reply_markup=draft_buttons(mid))
-        db.update("messages", mid, tg_message_id=msg.message_id)
+        await update.message.reply_text("✍️ Editing…")
+        new = await engine.redraft(mid, text)
+        await refresh_draft(mid)
+        others = [r["id"] for r in db.q("SELECT id FROM messages WHERE batch_date=? AND status='draft' AND id!=?",
+                                        (engine.today(), mid))] if new["apply_to_all"] else []
+        for i, other in enumerate(others, 1):
+            await engine.redraft(other, text)
+            await refresh_draft(other)
+        done = f"✅ Done: {new['summary'] or 'updated'}" + (f" — also applied to {len(others)} other drafts" if others else "")
+        await update.message.reply_text(done + ". The updated draft is above.")
         return
     urls = jobs.URL_RE.findall(text)
     items = items_from_urls(urls)
@@ -281,7 +341,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         drafts = db.q("SELECT id FROM messages WHERE batch_date=? AND status='draft'", (engine.today(),))
         for d in drafts:
             await approve(d["id"])
-        await query.edit_message_text(f"🚀 Sending {len(drafts)} emails, a few minutes apart. I'll report each one.")
+        await query.edit_message_text(f"🚀 Sending {len(drafts)} emails, about a minute apart. I'll report each one.")
     elif action == "skipday":
         db.run("UPDATE messages SET status='dropped' WHERE batch_date=? AND status='draft'", (engine.today(),))
         await query.edit_message_text("❌ Skipped today's batch. These people stay in the list for later.")
@@ -300,7 +360,52 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await query.message.reply_text("🗑 Dropped — I won't contact this person.")
     elif action == "edit":
         _state["editing"] = mid
-        await query.message.reply_text("✏️ What should I change in this email?")
+        await query.message.reply_text("✏️ What should I change? e.g. \"subject: Backend Engineer – Jane Doe\", "
+                                       "\"rename the resume to Jane_Doe_Backend_Engineer\", \"make it shorter\". "
+                                       "Add \"for all emails\" to change every draft in today's batch.")
+
+
+@owner_only
+async def on_li_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    try:
+        await query.answer()
+    except TelegramError:
+        pass
+    _, action, arg = query.data.split("|")
+    pid = int(arg)
+    await query.edit_message_reply_markup(None)
+    if action == "send":
+        db.update("li_people", pid, status="msg_approved")
+        await query.message.reply_text("✅ Sending it on LinkedIn…")
+        asyncio.create_task(li_run(li_flow.send_now))
+    elif action == "edit":
+        _state["editing"] = ("li", pid)
+        await query.message.reply_text("✏️ What should I change in this message?")
+    elif action == "drop":
+        db.update("li_people", pid, status="skipped")
+        await query.message.reply_text("🗑 Skipped — I won't message them.")
+
+
+@owner_only
+async def cmd_linkedin(update: Update, ctx) -> None:
+    arg = _arg(ctx).lower()
+    if arg == "pause":
+        db.set_setting("li_paused", "1")
+        await update.message.reply_text("⏸ LinkedIn paused. /linkedin resume to restart.")
+        return
+    if arg == "resume":
+        db.set_setting("li_paused", "0")
+        await update.message.reply_text("▶️ LinkedIn on.")
+    if arg == "now":
+        if not linkedin.has_session():
+            await update.message.reply_text(li_flow.stats())
+            return
+        await update.message.reply_text("🔗 Running a LinkedIn round now (requests are spaced out, so it takes a while)…")
+        db.set_setting("li_last_run", db.now())
+        asyncio.create_task(li_run(li_flow.cycle))
+        return
+    await update.message.reply_text(li_flow.stats(), disable_web_page_preview=True)
 
 
 def _arg(ctx) -> str:
@@ -402,6 +507,7 @@ async def post_init(app: Application) -> None:
     loop = asyncio.get_running_loop()
     loop.create_task(sender())
     loop.create_task(scheduler())
+    loop.create_task(linkedin_loop())
     for r in db.q("SELECT id FROM messages WHERE status='approved'"):  # resume sending after a restart
         await send_queue.put(r["id"])
     await say("🎯 Prospector is online. /help")
@@ -411,9 +517,11 @@ def build_app() -> Application:
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).concurrent_updates(True).post_init(post_init).build()
     for name, fn in [("start", cmd_help), ("help", cmd_help), ("run", cmd_run), ("drafts", cmd_drafts),
                      ("add", cmd_add), ("stats", cmd_stats), ("export", cmd_export), ("companies", cmd_companies),
-                     ("stage", cmd_stage), ("pause", cmd_pause), ("resume", cmd_resume), ("check", cmd_check)]:
+                     ("stage", cmd_stage), ("pause", cmd_pause), ("resume", cmd_resume), ("check", cmd_check),
+                     ("linkedin", cmd_linkedin)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^p\|"))
+    app.add_handler(CallbackQueryHandler(on_li_button, pattern=r"^l\|"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app

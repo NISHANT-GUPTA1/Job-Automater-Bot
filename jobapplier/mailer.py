@@ -5,6 +5,7 @@ Mails sent via Gmail SMTP appear in your Gmail "Sent" folder automatically.
 """
 import asyncio
 import email
+import html
 import imaplib
 import mimetypes
 import re
@@ -24,6 +25,55 @@ def _check_config() -> None:
         raise RuntimeError("GMAIL_ADDRESS / GMAIL_APP_PASSWORD missing in .env")
 
 
+# Appended to every email-writing prompt: the body is plain text with light markup that to_html() renders.
+FORMAT_RULE = ("Formatting: short paragraphs separated by a blank line; put highlights/evidence as bullet lines "
+               "starting with \"- \"; wrap the 2-4 most important phrases (the role, key results and numbers) in "
+               "**double asterisks** to make them bold. No other markdown, no headings.")
+
+_BULLET = re.compile(r"^\s*[-*•]\s+")
+
+
+def _inline(text: str) -> str:
+    t = html.escape(text)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
+    return re.sub(r"(https?://[^\s<]+)", r'<a href="\1">\1</a>', t)
+
+
+def to_html(body: str) -> str:
+    """Plain body -> HTML email: paragraphs, real bullet lists, **bold**, clickable links."""
+    parts, para, items = [], [], []
+
+    def flush() -> None:
+        if para:
+            parts.append("<p style=\"margin:0 0 12px\">" + "<br>".join(_inline(l) for l in para) + "</p>")
+            para.clear()
+        if items:
+            parts.append("<ul style=\"margin:0 0 12px;padding-left:22px\">"
+                         + "".join(f"<li style=\"margin-bottom:4px\">{_inline(i)}</li>" for i in items) + "</ul>")
+            items.clear()
+
+    for line in body.splitlines():
+        if _BULLET.match(line):
+            if para:
+                flush()
+            items.append(_BULLET.sub("", line, count=1).strip())
+        elif not line.strip():
+            flush()
+        else:
+            if items:
+                flush()
+            para.append(line.strip())
+    flush()
+    return ("<div style=\"font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;color:#222\">"
+            + "".join(parts) + "</div>")
+
+
+def to_plain(body: str) -> str:
+    """The text version: bold markers removed, bullets as •."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", body)
+    return "\n".join(_BULLET.sub("• ", l, count=1) if _BULLET.match(l) else l for l in text.splitlines())
+
+
 def _send(to: str, subject: str, body: str, attachments: list[str], in_reply_to: str | None = None,
           from_name: str | None = None) -> str:
     _check_config()
@@ -35,7 +85,8 @@ def _send(to: str, subject: str, body: str, attachments: list[str], in_reply_to:
     if in_reply_to:  # follow-up: shows up as a reply in the same thread
         msg["In-Reply-To"] = in_reply_to
         msg["References"] = in_reply_to
-    msg.set_content(body)
+    msg.set_content(to_plain(body))
+    msg.add_alternative(to_html(body), subtype="html")
     for path in attachments:
         p = Path(path)
         ctype, _ = mimetypes.guess_type(p.name)

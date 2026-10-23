@@ -368,7 +368,8 @@ def _free_profile() -> None:
         ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='msedge.exe'\" | "
               f"Where-Object {{ $_.CommandLine -like '*{profile_dir}*' }} | "
               "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=60)
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=60,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
     else:
         subprocess.run(["pkill", "-f", profile_dir], capture_output=True)
     time.sleep(2)

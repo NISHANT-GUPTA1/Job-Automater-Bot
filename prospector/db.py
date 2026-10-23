@@ -34,6 +34,15 @@ CREATE TABLE IF NOT EXISTS apollo_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT, endpoint TEXT, credits INTEGER, created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS li_people (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER, contact_id INTEGER,    -- contact_id: the person we emailed (empty for YC founders)
+    name TEXT, title TEXT, slug TEXT UNIQUE, profile_url TEXT, source TEXT,
+    status TEXT DEFAULT 'queued',              -- queued, invited, accepted, msg_draft, msg_approved, messaged,
+                                               -- replied, failed, msg_failed, skipped
+    note TEXT, message TEXT, error TEXT, reply_snippet TEXT,
+    invited_at TEXT, accepted_at TEXT, messaged_at TEXT, replied_at TEXT, created_at TEXT
+);
 """
 
 _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
@@ -45,6 +54,8 @@ if "employees" not in [r[1] for r in _conn.execute("PRAGMA table_info(companies)
 if "attachment" not in [r[1] for r in _conn.execute("PRAGMA table_info(messages)")]:
     _conn.execute("ALTER TABLE messages ADD COLUMN attachment TEXT")   # resume sent with this email
     _conn.execute("ALTER TABLE messages ADD COLUMN attach_note TEXT")  # "reused from job #12" / "new, $0.013"
+if "attachment" not in [r[1] for r in _conn.execute("PRAGMA table_info(li_people)")]:
+    _conn.execute("ALTER TABLE li_people ADD COLUMN attachment TEXT")  # resume PDF sent with the first message
 _conn.commit()
 
 
@@ -86,6 +97,11 @@ def credits_this_month(prefix: str = "/") -> int:
     month = datetime.now().strftime("%Y-%m")
     return q1("SELECT COALESCE(SUM(credits),0) c FROM apollo_usage WHERE created_at LIKE ? AND endpoint LIKE ?",
               (month + "%", prefix + "%"))["c"]
+
+
+def credits_today(prefix: str = "/") -> int:
+    return q1("SELECT COALESCE(SUM(credits),0) c FROM apollo_usage WHERE created_at LIKE ? AND endpoint LIKE ?",
+              (datetime.now().strftime("%Y-%m-%d") + "%", prefix + "%"))["c"]
 
 
 def log_credits(endpoint: str, credits: int) -> None:

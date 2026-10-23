@@ -2,7 +2,10 @@
 
 Docs: https://hunter.io/api-documentation/v2 (Domain Search, Email Verifier).
 """
+import calendar
 import logging
+import math
+from datetime import date
 
 import httpx
 
@@ -19,8 +22,14 @@ class HunterUnavailable(RuntimeError):
 async def _get(path: str, params: dict, kind: str, monthly_cap: int) -> dict:
     if not config.HUNTER_API_KEY:
         raise HunterUnavailable("HUNTER_API_KEY is missing in .env")
-    if db.credits_this_month(f"hunter:{kind}") >= monthly_cap:
+    used = db.credits_this_month(f"hunter:{kind}")
+    if used >= monthly_cap:
         raise HunterUnavailable(f"monthly Hunter {kind} limit reached ({monthly_cap})")
+    today = date.today()  # spread what's left evenly over the rest of the month
+    days_left = calendar.monthrange(today.year, today.month)[1] - today.day + 1
+    if db.credits_today(f"hunter:{kind}") >= math.ceil((monthly_cap - used + db.credits_today(f"hunter:{kind}"))
+                                                        / days_left):
+        raise HunterUnavailable(f"today's share of Hunter {kind}es is used (more tomorrow)")
     async with httpx.AsyncClient(timeout=40) as client:
         r = await client.get(BASE + path, params={**params, "api_key": config.HUNTER_API_KEY})
     if r.status_code in (401, 403, 429):
